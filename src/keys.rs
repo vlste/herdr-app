@@ -15,7 +15,7 @@
 //! (the program gets the key: the binding is switched off where this section
 //! applies).
 
-use gpui::{App, KeyBinding, KeyBindingContextPredicate, NoAction};
+use gpui::{App, KeyBinding, KeyBindingContextPredicate, Keystroke, NoAction};
 use std::rc::Rc;
 use gpui_shell::action::ShellAction;
 use std::collections::BTreeMap;
@@ -107,6 +107,33 @@ fn valid_action(action: &str) -> bool {
         || name.split_once('.').is_some_and(|(m, c)| !m.is_empty() && !c.is_empty())
 }
 
+/// macOS reports shift with a digit or symbol as the character it types:
+/// cmd+shift+] arrives as `cmd-}` (gpui keeps shift only on letters), so
+/// `cmd-shift-]` as written never matched. Bind such a key as it arrives,
+/// read on a US keyboard (macOS also uses it for cmd keys on non-Latin
+/// layouts). Letters and named keys (`shift-tab`) keep their shift.
+fn as_typed(keys: &str) -> String {
+    const SHIFTED: [(&str, &str); 21] = [
+        ("`", "~"), ("1", "!"), ("2", "@"), ("3", "#"), ("4", "$"), ("5", "%"), ("6", "^"),
+        ("7", "&"), ("8", "*"), ("9", "("), ("0", ")"), ("-", "_"), ("=", "+"), ("[", "{"),
+        ("]", "}"), ("\\", "|"), (";", ":"), ("'", "\""), (",", "<"), (".", ">"), ("/", "?"),
+    ];
+    keys.split_whitespace()
+        .map(|stroke| match Keystroke::parse(stroke) {
+            Ok(mut k) if k.modifiers.shift => match SHIFTED.iter().find(|(key, _)| k.key == *key) {
+                Some((_, typed)) => {
+                    k.modifiers.shift = false;
+                    k.key = typed.to_string();
+                    k.unparse()
+                }
+                None => stroke.to_owned(),
+            },
+            _ => stroke.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Reads keys.json (writing the defaults if it's missing) into bindings, or says what's wrong.
 pub fn load() -> Result<Vec<KeyBinding>, String> {
     let p = path();
@@ -162,7 +189,9 @@ pub fn parse(text: &str) -> Result<Vec<KeyBinding>, String> {
                 let native: Option<Box<dyn gpui::Action>> = None;
                 native.unwrap_or_else(|| Box::new(ShellAction::new(action.clone())))
             };
-            let binding = KeyBinding::load(keys, action, predicate, false, None, &gpui::DummyKeyboardMapper);
+            // Only macOS drops shift from a shifted digit or symbol (see as_typed).
+            let pressed = if cfg!(target_os = "macos") { as_typed(keys) } else { keys.clone() };
+            let binding = KeyBinding::load(&pressed, action, predicate, false, None, &gpui::DummyKeyboardMapper);
             match binding {
                 Ok(b) => out.push(b),
                 Err(e) => problems.push(format!("{section}.{keys}: {e}")),
@@ -201,6 +230,36 @@ mod tests {
         assert_eq!(super::current("context.new"), "tab.new");
         assert_eq!(super::current("mod.open:start"), "tab.new");
         assert_eq!(super::current("pane.zoom"), "pane.zoom");
+    }
+
+    #[test]
+    fn shifted_digits_and_symbols_bind_as_typed() {
+        let same = |written: &str, typed: &str| {
+            let parse = |k: &str| gpui::Keystroke::parse(k).unwrap();
+            assert_eq!(parse(&super::as_typed(written)), parse(typed), "{written}");
+        };
+        same("cmd-shift-]", "cmd-}");
+        same("cmd-shift-[", "cmd-{");
+        same("cmd-shift-/", "cmd-?");
+        same("ctrl-alt-shift-1", "ctrl-alt-!");
+        same("cmd-shift--", "cmd-_");
+        // Letters and named keys keep their shift; unshifted keys stay as written.
+        same("cmd-shift-d", "cmd-shift-d");
+        same("cmd-alt-shift-left", "cmd-alt-shift-left");
+        same("shift-f2", "shift-f2");
+        same("cmd-]", "cmd-]");
+        assert_eq!(super::as_typed("ctrl-k shift-/"), "ctrl-k ?");
+    }
+
+    /// How macOS reports cmd+shift+]: shift dropped, `}` as the key.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shifted_symbol_keys_match_what_macos_reports() {
+        for (written, pressed) in [("cmd-shift-]", "cmd-}"), ("cmd-shift-[", "cmd-{"), ("cmd-shift-/", "cmd-?")] {
+            let bindings = super::parse(&format!(r#"{{"global":{{"{written}":"tab.next"}}}}"#)).unwrap();
+            let pressed = gpui::Keystroke::parse(pressed).unwrap();
+            assert!(pressed.should_match(&bindings[0].keystrokes()[0]), "{written}");
+        }
     }
 
     #[test]
